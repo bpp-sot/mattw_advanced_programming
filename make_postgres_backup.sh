@@ -17,6 +17,31 @@ usage() {
   return 3
 }
 
+#------------------------------------------------------------------------------
+# Function: runDatabaseSnapshotClearUp
+#
+# Purpose:
+#   Implements the snapshot retention policy for PostgreSQL backups by:
+#     - Ensuring a minimum number of backups are always retained (>= 3)
+#     - Identifying backup directories older than the configured retention
+#       threshold (default: 10 days)
+#     - Deleting only those directories that exceed both conditions
+#
+# Behaviour:
+#   - Validates that BACKUP_FOLDER exists
+#   - Counts immediate subdirectories (each representing a single backup)
+#   - If 3 or fewer backups exist, no deletion is performed (safety rule)
+#   - Otherwise, finds backups older than $days_old and deletes them
+#
+# Safety Guarantees:
+#   - Uses -mindepth 1 and -maxdepth 1 to ensure only immediate subdirectories
+#     are considered, preventing accidental deletion of the root folder or
+#     nested content.
+#   - Uses explicit directory matching (-type d) to avoid file deletion.
+#
+# Returns:
+#   0 on success, 1 on validation failure.
+#------------------------------------------------------------------------------
 function runDatabaseSnapshotClearUp
 {
   #
@@ -33,8 +58,9 @@ function runDatabaseSnapshotClearUp
   local days_old=10
   local old_files
   local preview_backups
+  local file_count
 
-  # Validate directory
+  # Validate directory exists
   if [[ ! -d "${BACKUP_FOLDER}" ]]; then
       echo "ERROR: Directory '${BACKUP_FOLDER}' does not exist."
       return 1
@@ -43,18 +69,19 @@ function runDatabaseSnapshotClearUp
   fi
 
   # Count total subdirectories in directory
-  local file_count
+  # -type d sets the find operator to look for directories rather than -f which searches for files
   file_count=$(find "$BACKUP_FOLDER" -mindepth 1 -type d | wc -l)
 
   echo "Found $file_count backups in '${BACKUP_FOLDER}'."
 
-  # Rule: If 3 or fewer files exist � do NOT delete anything
+  # Rule: If 3 or fewer files exist ’ do NOT delete anything
   if (( file_count <= 3 )); then
+      # Function exits at this point
       echo "Only $file_count files present. No Clearup performed."
       echo "#-----------------------------"
       echo "# Snapshot Clearup Completed"
       echo "#-----------------------------"
-      return 0   # Function exits at this point
+      return 0   
   fi
 
   echo "Scanning for files older than $days_old days..."
@@ -63,14 +90,14 @@ function runDatabaseSnapshotClearUp
   old_files=$(find "$BACKUP_FOLDER" -maxdepth 1 -mindepth 1 -type d -mtime +"$days_old" | wc -l)
 
   echo "Found $old_files backups in '${BACKUP_FOLDER}' older than $days_old."
-
-
-  if [[ -z "$old_files" ]]; then
+  
+  if (( old_files == 0 )); then
+      # Function exits at this point
       echo "No files older than $days_old days found."
       echo "#-----------------------------"
       echo "# Snapshot Clearup Completed"
       echo "#-----------------------------"
-      return 0	# Function exits at this point
+      return 0
   fi
 
   echo "Deleting files older than $days_old days:"
@@ -79,7 +106,7 @@ function runDatabaseSnapshotClearUp
   preview_backups=$(find "$BACKUP_FOLDER" -mindepth 1 -maxdepth 1 -type d -mtime +"$days_old")
   echo "Backups in scope of deletion $preview_backups."
 
-  # Delete them	& log what's being removed
+  # Delete directories in scope	& log what's being deleted
   find "$BACKUP_FOLDER" -mindepth 1 -maxdepth 1 -type d -mtime +"$days_old" \
     -exec sh -c 'echo "Deleting: $1"; rm -rf "$1"' _ {} \;
 
@@ -89,6 +116,44 @@ function runDatabaseSnapshotClearUp
   return 0
 }
 
+#------------------------------------------------------------------------------
+# Function: runDatabaseSnapshotFull
+#
+# Purpose:
+#   Performs a full PostgreSQL snapshot backup consisting of:
+#     1. A global roles and database-wide configuration export (pg_dumpall --globals-only)
+#     2. A full logical dump of the specified database using pg_dump
+#
+# Rationale:
+#   PostgreSQL stores roles, permissions, and certain global objects outside
+#   individual databases. A complete snapshot therefore requires:
+#     - A globals dump (roles, tablespaces, privileges)
+#     - A per-database dump (schema + data)
+#   Combining both ensures the snapshot is fully restorable on a clean instance.
+#
+# Behaviour:
+#   - Executes pg_dumpall to capture global metadata
+#   - Executes pg_dump to capture the full logical state of $DATABASE
+#   - Writes both outputs into $OUTDIR
+#   - Applies permissive file permissions (chmod 777) to ensure downstream
+#     files are accessible
+#
+# Requirements:
+#   - Must be executed by a PostgreSQL superuser or a role with sufficient
+#     privileges to read global metadata and all database objects.
+#   - Assumes localhost connectivity and environment variables:
+#       $USER        PostgreSQL role used for authentication
+#       $DATABASE    Target database name
+#       $TYPE_BACKUP Label for the backup type (e.g., FULL, CORE)
+#       $OUTDIR      Output directory for generated dump files
+#
+# Output:
+#   - roles_globals.sql
+#   - <database>_<type>_snapshot.sql
+#
+# Returns:
+#   0 on success.
+#------------------------------------------------------------------------------
 function runDatabaseSnapshotFull
 {
 
@@ -118,6 +183,59 @@ function runDatabaseSnapshotFull
   return 0
 }
 
+#------------------------------------------------------------------------------
+# Function: runDatabaseSnapshotCore
+#
+# Purpose:
+#   Generates a *core* PostgreSQL snapshot consisting of:
+#     1. Global roles and cluster-wide metadata
+#     2. Schema-only dump (pre‑data and post‑data sections)
+#     3. Data-only dump for a curated subset of “core” tables defined in
+#        unicdc.backup_config (where vpd_only = 'Y')
+#     4. A final combined SQL file assembled in the correct restore order
+#
+# Rationale:
+#   Some environments require a lightweight snapshot that captures only the
+#   essential business‑critical tables rather than the full database. This
+#   function implements a selective backup strategy by:
+#     - Querying a configuration table to determine which tables qualify
+#       as “core”
+#     - Dumping only those tables’ data
+#     - Preserving the full schema structure to ensure referential integrity
+#   This approach reduces storage footprint and accelerates restore times
+#   while maintaining logical consistency.
+#
+# Behaviour:
+#   - Queries unicdc.backup_config to dynamically construct a list of tables
+#     to include in the snapshot (formatted as repeated -t arguments for pg_dump)
+#   - Exports global roles and metadata using pg_dumpall --globals-only
+#   - Extracts schema definitions in two phases:
+#       * pre-data  (DDL: types, tables, sequences)
+#       * post-data (constraints, indexes, triggers)
+#   - Dumps data only for the selected core tables
+#   - Concatenates the three components into a single, ordered SQL file
+#
+# Requirements:
+#   - Must be executed by a PostgreSQL superuser or a role with privileges to:
+#       * Query unicdc.backup_config
+#       * Read all schema objects
+#       * Export global metadata
+#   - Assumes localhost connectivity and environment variables:
+#       $USER        PostgreSQL role used for authentication
+#       $DATABASE    Target database name
+#       $TYPE_BACKUP Label for the backup type (e.g., FULL, CORE)
+#       $OUTDIR      Output directory for generated dump files
+#
+# Output:
+#   - roles_globals.sql
+#   - 00_schema_pre.sql
+#   - 01_selected_data.sql
+#   - 02_schema_post.sql
+#   - <database>_<type>_snapshot.sql (final combined snapshot)
+#
+# Returns:
+#   0 on success.
+#------------------------------------------------------------------------------
 function runDatabaseSnapshotCore
 {
 
@@ -147,8 +265,7 @@ function runDatabaseSnapshotCore
       WHERE b.vpd_only = 'Y';
     " | xargs
   )
-
-
+  
   echo "$CORE_TAB_LIST"
 
   # 0) Roles & globals (run as superuser to avoid peer issues)
@@ -168,7 +285,8 @@ function runDatabaseSnapshotCore
       "${OUTDIR}/01_selected_data.sql" \
       "${OUTDIR}/02_schema_post.sql" \
       > "${OUTDIR}/${DATABASE}_${TYPE_BACKUP}_snapshot.sql"
-
+      
+  # Chmod 777 to ensure files are accessible
   chmod 777 "${OUTDIR}/${DATABASE}_${TYPE_BACKUP}_snapshot.sql"
   chmod 777 "${OUTDIR}/roles_globals.sql"
 
@@ -179,6 +297,58 @@ function runDatabaseSnapshotCore
   return 0
 }
 
+#------------------------------------------------------------------------------
+# Function: validateInputParams
+#
+# Purpose:
+#   Performs defensive validation of all user‑supplied input parameters before
+#   any backup operation is executed. This ensures that:
+#     - Required parameters are present and correctly formatted
+#     - Only supported backup modes are executed
+#     - Invalid or malformed inputs are detected early, preventing runtime
+#       failures, unsafe operations, or unintended database actions
+#
+# Rationale:
+#   Shell scripts lack strong typing and are vulnerable to malformed input,
+#   accidental misuse, and injection risks. Centralising validation in a
+#   dedicated function provides:
+#     - A single point of enforcement for input correctness
+#     - Clear error reporting for end‑users
+#     - A proactive error‑handling mechanism that prevents invalid state from
+#       propagating into the backup workflow
+#
+# Behaviour:
+#   - Validates each required parameter using regular expressions or controlled
+#     enumerations
+#   - Accumulates validation errors rather than failing fast, allowing the user
+#     to see all issues in one pass
+#   - Returns a non‑zero exit code (20) if any validation rule fails
+#   - Returns 0 only when all parameters pass validation
+#
+# Validation Rules:
+#   DATABASE:
+#       - Must contain only alphanumeric characters, dots, underscores, or hyphens and must be populated
+#   USER:
+#       - Must contain only alphanumeric characters, dots, underscores, or hyphens and must be populated
+#   VERSION:
+#       - Must follow the pattern v<number> (e.g., v1, v2, v10)
+#   TYPE_BACKUP:
+#       - Must be one of: CORE or FULL
+#   CLEARUP:
+#       - Must be Y or N (case‑insensitive)
+#
+# Requirements:
+#   Assumes the following environment variables are set prior to invocation:
+#       $DATABASE
+#       $USER
+#       $VERSION
+#       $TYPE_BACKUP
+#       $CLEARUP
+#
+# Returns:
+#   0   if all parameters are valid
+#   20  if one or more validation checks fail
+#------------------------------------------------------------------------------
 function validateInputParams
 {
 
@@ -214,10 +384,10 @@ function validateInputParams
 
   # TYPE_BACKUP: must be CORE, CORE_SELECT, FULL
   case "$TYPE_BACKUP" in
-      CORE|CORE_SELECT|FULL)
+      CORE|FULL)
            ;; # valid
       *)
-          echo "ERROR: type_backup must be one of: CORE, CORE_SELECT, FULL."
+          echo "ERROR: type_backup must be one of: CORE, FULL."
           ERROR=1
           ;;
   esac
@@ -289,6 +459,7 @@ echo "USER            = $USER"
 echo "TYPE_BACKUP     = $TYPE_BACKUP"
 echo "CLEARUP         = $CLEARUP"
 
+# Set the exitcode before process begins
 EXITCODE=0
 
 # Call parameter validation function
@@ -307,9 +478,9 @@ BACKUP_FOLDER="/var/lib/pgsql/18/backups"
 STAMP="$(date +%Y_%m_%d)"
 OUTDIR="${BACKUP_FOLDER}/${DATABASE}_${STAMP}_${VERSION}"
 
-#mkdir "$OUTDIR"
+mkdir "$OUTDIR"
 
-#chmod 777 "$OUTDIR"
+chmod 777 "$OUTDIR"
 
 # Run Database Snapshot ClearUp if Clearup variable = Y
 if [[ ${CLEARUP^^} == "Y" ]]; then
@@ -331,9 +502,6 @@ fi
 case "${TYPE_BACKUP^^}" in
     CORE)
         runDatabaseSnapshotCore
-        ;;
-    CORE_SELECT)
-        echo "CORE_SELECT Chosen"
         ;;
     FULL)
         runDatabaseSnapshotFull
