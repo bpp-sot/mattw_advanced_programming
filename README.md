@@ -3,6 +3,8 @@
 
 This repository contains a modular Bash script designed to automate the backup of a PostgreSQL database. The script has been written with a strong emphasis on **modularity**, **parameterisation**, **portability**, and **robust error handling**, ensuring it can be reused across development, testing, and production environments with minimal modification. Below is a guide on how to use the script, inclduing it's key operations as well as detail on input parameters and how to run the script with example commands. The script also contains comments throughout explaining key pieces of functionality.
 
+Script can be found here: [make_postgres_backup.sh](https://github.com/bpp-sot/mattw_advanced_programming/blob/3e36231560bc4b79d16469acc64fb33b0da2291c/make_postgres_backup.sh)
+
 ---
 
 ## 📌 What the Script Does
